@@ -55,7 +55,15 @@ type SendStream struct {
 	deadline  time.Time
 
 	flowController flowcontrol.StreamFlowController
+
+	priority int
 }
+
+// SetPriority lets the app change scheduling weight (lower = higher priority).
+func (s *SendStream) SetPriority(p int) { s.priority = p }
+
+// Priority is what the framer reads.
+func (s *SendStream) Priority() int { return s.priority }
 
 var (
 	_ streamControlFrameGetter = &SendStream{}

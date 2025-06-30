@@ -106,7 +106,7 @@ func (f *framer) Append(
 		if protocol.MinStreamFrameSize > maxLen {
 			break
 		}
-		sf, blocked := f.getNextStreamFrame(maxLen, v)
+		sf, blocked := f.getNextStreamFramePriorityAware(maxLen, v)
 		if sf.Frame != nil {
 			streamFrames = append(streamFrames, sf)
 			maxLen -= sf.Frame.Length(v)
@@ -267,6 +267,68 @@ func (f *framer) getNextStreamFrame(maxLen protocol.ByteCount, v protocol.Versio
 	// Note that the frame.Frame can be nil:
 	// * if the stream was canceled after it said it had data
 	// * the remaining size doesn't allow us to add another STREAM frame
+	return frame, blocked
+}
+
+// getNextStreamFramePriorityAware is a replacement for getNextStreamFrame that
+// chooses the next stream based on an application‑defined priority.  A stream
+// can opt‑in by implementing:
+//
+//	Priority() int   // lower value == higher priority
+//
+// Streams that do not implement the method receive the default priority 255.
+// The algorithm visits every active stream ID exactly once per call,
+// selects the one with the highest priority, and re‑queues the others in the
+// same order they were found.
+func (f *framer) getNextStreamFramePriorityAware(maxLen protocol.ByteCount, v protocol.Version) (ackhandler.StreamFrame, *wire.StreamDataBlockedFrame) {
+	const defaultPrio = 255
+
+	var (
+		bestID    protocol.StreamID
+		bestPrio  = defaultPrio
+		bestFound bool
+	)
+
+	queueLen := f.streamQueue.Len()
+	for i := 0; i < queueLen; i++ {
+		id := f.streamQueue.PopFront()
+		str, ok := f.activeStreams[id]
+		if !ok {
+			// Stream finished after it was queued.
+			continue
+		}
+
+		prio := defaultPrio
+		if p, ok := any(str).(interface{ Priority() int }); ok {
+			prio = p.Priority()
+		}
+
+		if !bestFound || prio < bestPrio {
+			// Push the previous best back so it keeps its place.
+			if bestFound {
+				f.streamQueue.PushBack(bestID)
+			}
+			bestID, bestPrio, bestFound = id, prio, true
+		} else {
+			f.streamQueue.PushBack(id)
+		}
+	}
+
+	if !bestFound {
+		return ackhandler.StreamFrame{}, nil
+	}
+
+	// Use the same varint trick as getNextStreamFrame: pretend to have room
+	// for the DataLen field so popStreamFrame may fill the entire maxLen.
+	str := f.activeStreams[bestID]
+	maxLen += protocol.ByteCount(quicvarint.Len(uint64(maxLen)))
+
+	frame, blocked, hasMore := str.popStreamFrame(maxLen, v)
+	if hasMore {
+		f.streamQueue.PushBack(bestID)
+	} else {
+		delete(f.activeStreams, bestID)
+	}
 	return frame, blocked
 }
 
